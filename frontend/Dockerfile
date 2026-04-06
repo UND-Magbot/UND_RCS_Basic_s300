@@ -24,6 +24,6 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/public ./public
 
-EXPOSE 3002
+EXPOSE 3003
 
-CMD ["npm", "start", "--", "-p", "3002"]
+CMD ["npm", "start", "--", "-p", "3003"]

@@ -143,15 +143,15 @@ def api_list_jobs():
 # ── 랙 스펙 설정 ──
 
 class RackSpec(BaseModel):
-    width: float = 0.83
-    depth: float = 0.87
-    margin: list[float] = [0.05, 0.05, 0.05, 0.05]
+    width: float = 0.765
+    depth: float = 0.765
+    margin: list[float] = [0.0925, 0.0925, 0.0925, 0.0925]
     alignment: str = "center"
     alignment_margin_back: float = 0.02
     extra_leg_offset: float = 0.0
     leg_shape: str = "other"
-    leg_size: float = 0.05
-    foot_radius: float = 0.025
+    leg_size: float = 0.04
+    foot_radius: float = 0.02
 
 
 @router.get("/rack-specs/{robot_ip}")

@@ -85,15 +85,15 @@
 ```json
 {
   "rack.specs": [{
-    "width": 0.83,
-    "depth": 0.87,
-    "margin": [0.05, 0.05, 0.05, 0.05],
+    "width": 0.765,
+    "depth": 0.765,
+    "margin": [0.0925, 0.0925, 0.0925, 0.0925],
     "alignment": "center",
     "alignment_margin_back": 0.02,
     "extra_leg_offset": 0.0,
     "leg_shape": "other",
-    "leg_size": 0.05,
-    "foot_radius": 0.025,
+    "leg_size": 0.04,
+    "foot_radius": 0.02,
     "cargo_to_jack_front_edge_min_distance": 0.05
   }]
 }
@@ -188,10 +188,10 @@
 - ~~작업 진행 중 실행/종료 버튼 비활성화~~
 
 ### S600 랙 지원 (완료)
-- ~~rack.specs: width=0.83, depth=0.87, leg_shape=other, leg_size=0.05~~
-- ~~foot_radius=0.025, margin=[0.05,0.05,0.05,0.05], hasFixedLegs=false~~
+- ~~rack.specs: width=0.765, depth=0.765, leg_shape=other, leg_size=0.04~~
+- ~~foot_radius=0.02, margin=[0.0925,0.0925,0.0925,0.0925], hasFixedLegs=false~~
 - ~~Shelves Point yaw +180도 보정~~
-- ~~프론트엔드 랙 마커 크기 0.83x0.87~~
+- ~~프론트엔드 랙 마커 크기 0.765x0.765~~
 
 ### 버그 수정 (완료)
 - ~~_get_standby_poi() 현재 맵 필터 추가 (이전 맵 POI 좌표 사용 버그)~~
@@ -220,7 +220,7 @@ DB_PORT=3306
 DB_USER=root
 DB_PASSWORD=1234
 DB_NAME=rcs_basic_db
-NEXT_PUBLIC_API_URL=http://서버IP:8002
+NEXT_PUBLIC_API_URL=http://서버IP:8003
 EOF
 docker-compose up -d --build
 ```
@@ -236,9 +236,9 @@ ALTER TABLE robots ADD COLUMN max_speed FLOAT DEFAULT 1.2;
 ```
 
 ### 접속 주소
-- 웹: `http://서버IP:3002`
-- 백엔드 API: `http://서버IP:8002`
-- 태블릿: 앱 설정 → 서버 주소 `http://서버IP:8002`, 로봇 ID 확인
+- 웹: `http://서버IP:3003`
+- 백엔드 API: `http://서버IP:8003`
+- 태블릿: 앱 설정 → 서버 주소 `http://서버IP:8003`, 로봇 ID 확인
 
 ## 업무일지 양식
 ```

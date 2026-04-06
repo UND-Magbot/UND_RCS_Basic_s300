@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8002";
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8003";
 
 interface RemoteControlModalProps {
   robotName: string;

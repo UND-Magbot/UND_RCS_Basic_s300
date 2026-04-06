@@ -468,8 +468,8 @@ export function MonitoringClient({ initialDateTime }: Props) {
         };
         // jack POI: rack.specs 크기를 픽셀로 변환
         if ((p.type === "jack" || p.type === "standby") && mapMeta && mapMeta.grid_resolution > 0) {
-          const RACK_W = 0.83; // meters
-          const RACK_D = 0.87;
+          const RACK_W = 0.765; // meters
+          const RACK_D = 0.765;
           poiData.rackWidthPx = RACK_W / mapMeta.grid_resolution;
           poiData.rackDepthPx = RACK_D / mapMeta.grid_resolution;
         }

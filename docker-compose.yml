@@ -4,7 +4,7 @@ services:
       context: ./BackEnd
       dockerfile: Dockerfile
     ports:
-      - "8002:8002"
+      - "8003:8003"
     environment:
       - TZ=Asia/Seoul
       - DB_HOST=${SERVER_IP:-192.168.0.44}
@@ -17,7 +17,7 @@ services:
       - /home/administrator:/home/administrator
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/ping')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/ping')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -27,9 +27,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://192.168.0.44:8002}
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://192.168.0.44:8003}
     ports:
-      - "3002:3002"
+      - "3003:3003"
     depends_on:
       backend:
         condition: service_healthy

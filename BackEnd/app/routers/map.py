@@ -1029,14 +1029,14 @@ def api_sync_map_to_robot(map_id: int, body: dict, db: Session = Depends(get_db)
         try:
             _rack_specs = {
                 "rack.specs": [{
-                    "width": 0.83, "depth": 0.87,
-                    "margin": [0.1, 0.1, 0.1, 0.1],
+                    "width": 0.765, "depth": 0.765,
+                    "margin": [0.0925, 0.0925, 0.0925, 0.0925],
                     "alignment": "center",
                     "alignment_margin_back": 0.02,
                     "extra_leg_offset": 0.0,
                     "leg_shape": "other",
-                    "leg_size": 0.05,
-                    "foot_radius": 0.025,
+                    "leg_size": 0.04,
+                    "foot_radius": 0.02,
                     "cargo_to_jack_front_edge_min_distance": 0.05,
                 }]
             }
@@ -1447,11 +1447,11 @@ def api_sync_overlays_to_robot(map_id: int, body: dict, db: Session = Depends(ge
                 f"http://{robot_ip}:8090/system/settings/user",
                 headers={"Authorization": f"Secret {target_secret}"},
                 json={"rack.specs": [{
-                    "width": 0.83, "depth": 0.87,
-                    "margin": [0.1, 0.1, 0.1, 0.1], "alignment": "center",
+                    "width": 0.765, "depth": 0.765,
+                    "margin": [0.0925, 0.0925, 0.0925, 0.0925], "alignment": "center",
                     "alignment_margin_back": 0.02, "extra_leg_offset": 0.0,
-                    "leg_shape": "other", "leg_size": 0.05,
-                    "foot_radius": 0.025, "cargo_to_jack_front_edge_min_distance": 0.05,
+                    "leg_shape": "other", "leg_size": 0.04,
+                    "foot_radius": 0.02, "cargo_to_jack_front_edge_min_distance": 0.05,
                 }]}, timeout=5,
             )
             logger.info(f"[sync-overlays] rack.specs 자동 설정 완료 → {robot_ip}")
