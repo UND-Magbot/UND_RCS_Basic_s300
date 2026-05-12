@@ -4,6 +4,7 @@
 - 잭킹 흐름 실행 (align_with_rack → jack_up → to_unload_point → jack_down → standby)
 """
 import logging
+import threading as _threading
 import time
 from typing import Callable, Optional
 
@@ -163,7 +164,6 @@ def release_w_zone(ip: str):
 _job_status: dict[str, dict] = {}
 
 # 수동 확인 대기 (robot_ip → threading.Event)
-import threading as _threading
 _confirm_events: dict[str, _threading.Event] = {}
 
 # 다음 포인트 (robot_ip → poi dict or "return")
