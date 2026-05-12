@@ -87,3 +87,124 @@
   color: var(--text-muted);
   margin-left: 2px;
 }
+
+/* === 모드 탭 === */
+.jack-test-panel__tabs {
+  display: flex;
+  gap: 4px;
+  background: var(--bg-surface-2);
+  padding: 3px;
+  border-radius: var(--radius-badge);
+  border: 1px solid var(--border);
+}
+
+.jack-test-panel__tab {
+  flex: 1;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  border-radius: calc(var(--radius-badge) - 2px);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.jack-test-panel__tab--active {
+  background: var(--bg-surface-1);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+/* === 그룹 셔틀 === */
+.shuttle-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-badge);
+}
+
+.shuttle-row__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-secondary);
+}
+
+.shuttle-row__remove {
+  background: transparent;
+  border: none;
+  color: var(--color-error);
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.shuttle-row__remove:hover {
+  opacity: 0.7;
+}
+
+.shuttle-row__field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--font-size-xs);
+  color: var(--text-muted);
+}
+
+.shuttle-row__select,
+.shuttle-row__input {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg-surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-button);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+}
+
+.shuttle-row__status {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg-surface-1);
+  border-radius: var(--radius-button);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  border-left: 3px solid var(--color-warning);
+}
+
+.shuttle-row__status--done {
+  border-left-color: var(--color-success);
+}
+
+.shuttle-row__status--error {
+  border-left-color: var(--color-error);
+}
+
+.shuttle-add-btn {
+  padding: 8px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-badge);
+  color: var(--text-muted);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.shuttle-add-btn:hover:not(:disabled) {
+  background: var(--bg-surface-2);
+  color: var(--text-primary);
+}
+
+.shuttle-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

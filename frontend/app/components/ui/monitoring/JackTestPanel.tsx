@@ -40,6 +40,7 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 export function JackTestPanel({ liveRobots, areaId }: Props) {
+  const [mode, setMode] = useState<"single" | "shuttle">("single");
   const [robotIp, setRobotIp] = useState("");
   const [robotId, setRobotId] = useState<number>(0);
   const [pois, setPois] = useState<PoiOption[]>([]);
@@ -149,6 +150,28 @@ export function JackTestPanel({ liveRobots, areaId }: Props) {
     <div className="jack-test-panel">
       <h3 className="jack-test-panel__title">수동 배차</h3>
 
+      <div className="jack-test-panel__tabs" role="tablist">
+        <button
+          type="button"
+          className={`jack-test-panel__tab${mode === "single" ? " jack-test-panel__tab--active" : ""}`}
+          onClick={() => setMode("single")}
+          disabled={isRunning}
+        >
+          단일
+        </button>
+        <button
+          type="button"
+          className={`jack-test-panel__tab${mode === "shuttle" ? " jack-test-panel__tab--active" : ""}`}
+          onClick={() => setMode("shuttle")}
+          disabled={isRunning}
+        >
+          그룹 셔틀
+        </button>
+      </div>
+
+      {mode === "shuttle" ? (
+        <GroupShuttleSection onlineRobots={onlineRobots} pois={pois} />
+      ) : (
       <div className="jack-test-panel__form">
         <label className="jack-test-panel__label">
           로봇
@@ -235,8 +258,9 @@ export function JackTestPanel({ liveRobots, areaId }: Props) {
           )}
         </div>
       </div>
+      )}
 
-      {currentJob && (
+      {mode === "single" && currentJob && (
         <div className="jack-test-panel__status" style={{ borderColor: statusColor }}>
           <div className="jack-test-panel__status-label" style={{ color: statusColor }}>
             {STATUS_LABELS[currentJob.status] || currentJob.status}
@@ -290,6 +314,410 @@ export function JackTestPanel({ liveRobots, areaId }: Props) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════
+// 그룹 셔틀 섹션 (다수 로봇 W↔C 무한 왕복)
+// ══════════════════════════════════════
+
+type ShuttleEntry = {
+  uid: number;
+  robotId: number;
+  robotIp: string;
+  pickupId: number;
+  workId: number;
+  chargerId: number;
+  waitSec: number;
+  maxCycles: number;  // 0 = 무한
+};
+
+type ShuttleStatus = {
+  status: string;
+  message: string;
+  route?: string;
+};
+
+const MAX_SHUTTLE_ROBOTS = 3;
+let _uidSeq = 0;
+const newUid = () => ++_uidSeq;
+
+function GroupShuttleSection({
+  onlineRobots,
+  pois,
+}: {
+  onlineRobots: LiveRobot[];
+  pois: PoiOption[];
+}) {
+  // 픽업(W)은 standby 또는 jack, 작업(C)은 jack 모두 허용
+  // (W1~W3는 보통 standby로 등록되지만 Shelves Point overlay가 있어 잭 픽업 가능)
+  const pickupPois = pois.filter((p) => p.type === "standby" || p.type === "jack");
+  const workPois = pois.filter((p) => p.type === "jack" || p.type === "standby");
+  const chargerPois = pois.filter((p) => p.type === "charging");
+  const [entries, setEntries] = useState<ShuttleEntry[]>([
+    { uid: newUid(), robotId: 0, robotIp: "", pickupId: 0, workId: 0, chargerId: 0, waitSec: 0, maxCycles: 0 },
+  ]);
+  const [startDelaySec, setStartDelaySec] = useState<number>(5);
+  const [running, setRunning] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [statuses, setStatuses] = useState<Record<string, ShuttleStatus>>({});
+  const [errorMsg, setErrorMsg] = useState<string>("");
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => () => {
+    if (pollingRef.current) clearInterval(pollingRef.current);
+  }, []);
+
+  const updateEntry = (uid: number, patch: Partial<ShuttleEntry>) => {
+    setEntries((prev) => prev.map((e) => (e.uid === uid ? { ...e, ...patch } : e)));
+  };
+
+  const addRow = () => {
+    if (entries.length >= MAX_SHUTTLE_ROBOTS) return;
+    setEntries((prev) => [
+      ...prev,
+      { uid: newUid(), robotId: 0, robotIp: "", pickupId: 0, workId: 0, chargerId: 0, waitSec: 0, maxCycles: 0 },
+    ]);
+  };
+
+  const removeRow = (uid: number) => {
+    setEntries((prev) => (prev.length <= 1 ? prev : prev.filter((e) => e.uid !== uid)));
+  };
+
+  const handleRobotChange = (uid: number, ip: string) => {
+    const r = onlineRobots.find((x) => x.IP === ip);
+    updateEntry(uid, { robotIp: ip, robotId: r?.ID || 0 });
+  };
+
+  const validate = (): string | null => {
+    const valid = entries.filter((e) => e.robotId && e.pickupId && e.workId);
+    if (valid.length === 0) return "최소 1개 행 이상 입력하세요";
+    const robotIds = valid.map((e) => e.robotId);
+    if (new Set(robotIds).size !== robotIds.length) return "로봇이 중복되었습니다";
+    for (const e of valid) {
+      if (e.pickupId === e.workId) return "픽업과 작업 POI가 동일합니다";
+    }
+    return null;
+  };
+
+  const startPolling = (ips: string[]) => {
+    if (pollingRef.current) clearInterval(pollingRef.current);
+    const fetchOnce = async () => {
+      const next: Record<string, ShuttleStatus> = {};
+      let anyActive = false;
+      await Promise.all(
+        ips.map(async (ip) => {
+          try {
+            const r = await fetch(`${API}/api/robots/job-status/${ip}`);
+            if (r.ok) {
+              const j = await r.json();
+              if (j.status && j.status !== "idle") {
+                next[ip] = {
+                  status: j.status,
+                  message: j.message || STATUS_LABELS[j.status] || j.status,
+                  route: j.route,
+                };
+                if (!["done", "error", "failed"].includes(j.status)) {
+                  anyActive = true;
+                }
+              } else {
+                next[ip] = { status: "idle", message: "대기 중" };
+              }
+            }
+          } catch {}
+        }),
+      );
+      setStatuses(next);
+      if (!anyActive) {
+        if (pollingRef.current) {
+          clearInterval(pollingRef.current);
+          pollingRef.current = null;
+        }
+        setRunning(false);
+      }
+    };
+    fetchOnce();
+    pollingRef.current = setInterval(fetchOnce, 2000);
+  };
+
+  const handleStart = async () => {
+    const err = validate();
+    if (err) {
+      setErrorMsg(err);
+      return;
+    }
+    setErrorMsg("");
+    setBusy(true);
+    const valid = entries.filter((e) => e.robotId && e.pickupId && e.workId);
+    try {
+      const res = await fetch(`${API}/api/tasks/group-shuttle/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          entries: valid.map((e) => ({
+            robot_id: e.robotId,
+            pickup_poi_id: e.pickupId,
+            work_poi_id: e.workId,
+            wait_sec: Number(e.waitSec) || 0,
+            charger_poi_id: e.chargerId || null,
+            max_cycles: Math.max(0, Number(e.maxCycles) || 0),
+          })),
+          start_delay_sec: Math.max(0, Number(startDelaySec) || 0),
+        }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || `HTTP ${res.status}`);
+      }
+      setRunning(true);
+      startPolling(valid.map((e) => e.robotIp));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "시작 실패";
+      setErrorMsg(msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleStop = async () => {
+    const valid = entries.filter((e) => e.robotId);
+    setBusy(true);
+    try {
+      await fetch(`${API}/api/tasks/group-shuttle/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ robot_ids: valid.map((e) => e.robotId) }),
+      });
+    } catch {}
+    setBusy(false);
+  };
+
+  const handleEmergencyStop = async () => {
+    if (!confirm("긴급 정지하시겠습니까? (충전소 복귀 없이 즉시 멈춤)")) return;
+    const valid = entries.filter((e) => e.robotIp);
+    setBusy(true);
+    await Promise.all(
+      valid.map((e) =>
+        fetch(`${API}/api/robots/remote/stop-all/${e.robotIp}`, { method: "POST" }).catch(() => {}),
+      ),
+    );
+    setBusy(false);
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setRunning(false);
+    setStatuses({});
+  };
+
+  const usedRobotIds = new Set(entries.map((e) => e.robotId).filter(Boolean));
+  const usedPickupIds = new Set(entries.map((e) => e.pickupId).filter(Boolean));
+  const usedWorkIds = new Set(entries.map((e) => e.workId).filter(Boolean));
+  const usedChargerIds = new Set(entries.map((e) => e.chargerId).filter(Boolean));
+
+  return (
+    <div className="jack-test-panel__form">
+      {entries.map((entry, idx) => {
+        const st = entry.robotIp ? statuses[entry.robotIp] : undefined;
+        const stCls =
+          st?.status === "done"
+            ? "shuttle-row__status shuttle-row__status--done"
+            : st?.status === "error" || st?.status === "failed"
+              ? "shuttle-row__status shuttle-row__status--error"
+              : "shuttle-row__status";
+        return (
+          <div key={entry.uid} className="shuttle-row">
+            <div className="shuttle-row__header">
+              <span>로봇 #{idx + 1}</span>
+              {entries.length > 1 && !running && (
+                <button
+                  type="button"
+                  className="shuttle-row__remove"
+                  onClick={() => removeRow(entry.uid)}
+                  aria-label="행 삭제"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+
+            <label className="shuttle-row__field">
+              로봇
+              <select
+                className="shuttle-row__select"
+                value={entry.robotIp}
+                onChange={(e) => handleRobotChange(entry.uid, e.target.value)}
+                disabled={running}
+              >
+                <option value="">선택</option>
+                {onlineRobots
+                  .filter((r) => r.IP === entry.robotIp || !usedRobotIds.has(r.ID))
+                  .map((r) => (
+                    <option key={r.IP} value={r.IP}>
+                      {r.ROBOTNAME || r.SN}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            <label className="shuttle-row__field">
+              랙 위치 (W)
+              <select
+                className="shuttle-row__select"
+                value={entry.pickupId}
+                onChange={(e) => updateEntry(entry.uid, { pickupId: Number(e.target.value) })}
+                disabled={running}
+              >
+                <option value={0}>선택</option>
+                {pickupPois
+                  .filter((p) => p.id === entry.pickupId || !usedPickupIds.has(p.id))
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            <label className="shuttle-row__field">
+              작업 포지션 (C)
+              <select
+                className="shuttle-row__select"
+                value={entry.workId}
+                onChange={(e) => updateEntry(entry.uid, { workId: Number(e.target.value) })}
+                disabled={running}
+              >
+                <option value={0}>선택</option>
+                {workPois
+                  .filter((p) => p.id === entry.workId || !usedWorkIds.has(p.id))
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            <label className="shuttle-row__field">
+              충전소 (복귀)
+              <select
+                className="shuttle-row__select"
+                value={entry.chargerId}
+                onChange={(e) => updateEntry(entry.uid, { chargerId: Number(e.target.value) })}
+                disabled={running}
+              >
+                <option value={0}>자동 (영역 첫 충전소)</option>
+                {chargerPois
+                  .filter((p) => p.id === entry.chargerId || !usedChargerIds.has(p.id))
+                  .map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+              </select>
+            </label>
+
+            <div style={{ display: "flex", gap: 6 }}>
+              <label className="shuttle-row__field" style={{ flex: 1 }}>
+                대기시간 (초)
+                <input
+                  type="number"
+                  className="shuttle-row__input"
+                  min={0}
+                  step={1}
+                  value={entry.waitSec}
+                  onChange={(e) => updateEntry(entry.uid, { waitSec: Number(e.target.value) || 0 })}
+                  disabled={running}
+                />
+              </label>
+              <label className="shuttle-row__field" style={{ flex: 1 }}>
+                반복 (0=무한)
+                <input
+                  type="number"
+                  className="shuttle-row__input"
+                  min={0}
+                  step={1}
+                  value={entry.maxCycles}
+                  onChange={(e) => updateEntry(entry.uid, { maxCycles: Math.max(0, Number(e.target.value) || 0) })}
+                  disabled={running}
+                  placeholder="무한"
+                />
+              </label>
+            </div>
+
+            {st && st.status !== "idle" && (
+              <div className={stCls}>
+                <strong>{STATUS_LABELS[st.status] || st.status}</strong>
+                <div style={{ marginTop: 2 }}>{st.message}</div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {!running && (
+        <label className="shuttle-row__field" style={{ paddingTop: 4 }}>
+          시작 간격 (초) — 동시 W 진입 충돌 방지
+          <input
+            type="number"
+            className="shuttle-row__input"
+            min={0}
+            step={1}
+            value={startDelaySec}
+            onChange={(e) => setStartDelaySec(Math.max(0, Number(e.target.value) || 0))}
+          />
+        </label>
+      )}
+
+      {!running && entries.length < MAX_SHUTTLE_ROBOTS && (
+        <button type="button" className="shuttle-add-btn" onClick={addRow}>
+          + 로봇 추가 ({entries.length}/{MAX_SHUTTLE_ROBOTS})
+        </button>
+      )}
+
+      {errorMsg && (
+        <div className="jack-test-panel__status" style={{ borderColor: "var(--color-error)" }}>
+          <div className="jack-test-panel__status-label" style={{ color: "var(--color-error)" }}>
+            오류
+          </div>
+          <div className="jack-test-panel__status-msg">{errorMsg}</div>
+        </div>
+      )}
+
+      <div className="jack-test-panel__buttons">
+        {!running ? (
+          <button
+            type="button"
+            className="btn btn--primary jack-test-panel__btn"
+            onClick={handleStart}
+            disabled={busy}
+          >
+            {busy ? "시작 중..." : "동시 시작"}
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="btn jack-test-panel__btn"
+              style={{ background: "var(--color-warning)", color: "white" }}
+              onClick={handleStop}
+              disabled={busy}
+            >
+              정지(현 사이클 후 복귀)
+            </button>
+            <button
+              type="button"
+              className="btn btn--danger jack-test-panel__btn"
+              onClick={handleEmergencyStop}
+              disabled={busy}
+            >
+              긴급 정지
+            </button>
+          </>
+        )}
+      </div>
     </div>
   );
 }

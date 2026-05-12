@@ -492,6 +492,168 @@ def api_manual_run_pois(data: ManualRunPoisRequest, db: Session = Depends(get_db
 
 
 # ══════════════════════════════════════
+# 그룹 셔틀 (다수 로봇 왕복 반복)
+# ══════════════════════════════════════
+
+class GroupShuttleEntry(_BaseModel):
+    robot_id: int
+    pickup_poi_id: int            # W_N (랙 위치)
+    work_poi_id: int              # C_N (작업 포지션)
+    wait_sec: int = 0             # C_N 잭다운 후 대기시간(초)
+    charger_poi_id: int | None = None  # 복귀할 충전소 POI (생략 시 robot.charging_id → 가까운 충전소)
+    max_cycles: int = 0           # 최대 사이클 수 (0 = 무한, N = N회 완료 후 자동 종료)
+
+
+class GroupShuttleStartRequest(_BaseModel):
+    entries: list[GroupShuttleEntry]
+    start_delay_sec: int = 5   # 로봇 간 시작 간격 — 동시 W 영역 진입으로 인한 첫 충돌 방지
+
+
+class GroupShuttleStopRequest(_BaseModel):
+    robot_ids: list[int]
+
+
+@router.post("/group-shuttle/start")
+def api_group_shuttle_start(data: GroupShuttleStartRequest, db: Session = Depends(get_db)):
+    """그룹 셔틀 시작 — 여러 로봇이 각자의 W_N ↔ C_N 사이를 무한 왕복.
+    정지 신호 받으면 현재 사이클을 마치고 충전소로 복귀.
+    """
+    if not data.entries:
+        raise HTTPException(400, "엔트리가 비어있습니다")
+
+    from app.services.jack_service import get_job_status
+
+    plans: list[dict] = []
+    seen_robot_ids: set[int] = set()
+    for entry in data.entries:
+        if entry.robot_id in seen_robot_ids:
+            raise HTTPException(400, f"로봇 중복 지정 (id={entry.robot_id})")
+        seen_robot_ids.add(entry.robot_id)
+
+        robot = db.query(Robot).filter(Robot.id == entry.robot_id).first()
+        if not robot or not robot.ip_address:
+            raise HTTPException(404, f"로봇을 찾을 수 없습니다 (id={entry.robot_id})")
+        if get_job_status(robot.ip_address):
+            raise HTTPException(409, f"이미 작업 중입니다: {robot.name}")
+
+        pickup = db.query(MapPOI).filter(MapPOI.id == entry.pickup_poi_id, MapPOI.is_active == True).first()
+        work = db.query(MapPOI).filter(MapPOI.id == entry.work_poi_id, MapPOI.is_active == True).first()
+        if not pickup or not work:
+            raise HTTPException(404, "POI를 찾을 수 없습니다")
+        if pickup.world_x is None or work.world_x is None:
+            raise HTTPException(400, "POI 좌표가 없습니다")
+        if entry.pickup_poi_id == entry.work_poi_id:
+            raise HTTPException(400, "픽업과 작업 POI가 동일합니다")
+
+        rmap = db.query(RobotMap).filter(RobotMap.id == pickup.map_id).first()
+        area_id = rmap.area_id if rmap else None
+
+        # 충전소 결정: entry.charger_poi_id → robot.charging_id → None(폴백은 셔틀 잡 내부에서)
+        charger_poi_id = entry.charger_poi_id or getattr(robot, "charging_id", None)
+        charger_dict = None
+        if charger_poi_id:
+            cp = db.query(MapPOI).filter(MapPOI.id == charger_poi_id, MapPOI.is_active == True).first()
+            if cp and cp.world_x is not None:
+                charger_dict = {
+                    "name": cp.name,
+                    "x": cp.world_x,
+                    "y": cp.world_y,
+                    "ori": cp.angle or 0,
+                }
+
+        plans.append({
+            "robot_ip": robot.ip_address,
+            "robot_id": robot.id,
+            "robot_name": robot.name,
+            "pickup": {"name": pickup.name, "x": pickup.world_x, "y": pickup.world_y, "ori": pickup.angle or 0},
+            "work": {"name": work.name, "x": work.world_x, "y": work.world_y, "ori": work.angle or 0},
+            "wait_sec": int(entry.wait_sec or 0),
+            "area_id": area_id,
+            "charger": charger_dict,
+            "max_cycles": max(0, int(entry.max_cycles or 0)),
+        })
+
+    histories = []
+    delay = max(0, int(data.start_delay_sec or 0))
+    for idx, plan in enumerate(plans):
+        history = TaskHistory(
+            task_name=f"그룹셔틀: {plan['pickup']['name']}↔{plan['work']['name']}",
+            route_name=f"{plan['pickup']['name']}↔{plan['work']['name']}",
+            robot_id=plan["robot_id"],
+            robot_name=plan["robot_name"],
+            pickup_poi_name=plan["pickup"]["name"],
+            dropoff_poi_name=plan["work"]["name"],
+            status="running",
+        )
+        db.add(history)
+        db.commit()
+        db.refresh(history)
+        history_id = history.id
+        histories.append({"robot_id": plan["robot_id"], "history_id": history_id})
+
+        start_offset = idx * delay  # 로봇 i 번째는 i*delay 초 후 시작
+
+        def _runner(p=plan, hid=history_id, offset=start_offset):
+            from app.services.jack_service import run_shuttle_job
+            from app.database import SessionLocal
+            if offset > 0:
+                import time as _time
+                logger.info(f"[group-shuttle] {p['robot_name']} 시작 지연 {offset}s (스태거링)")
+                _time.sleep(offset)
+            result = run_shuttle_job(
+                p["robot_ip"], p["pickup"], p["work"],
+                wait_sec=p["wait_sec"], area_id=p["area_id"],
+                charger=p.get("charger"),
+                max_cycles=p.get("max_cycles", 0),
+            )
+            db2 = SessionLocal()
+            try:
+                h = db2.query(TaskHistory).filter(TaskHistory.id == hid).first()
+                if h:
+                    h.status = "succeeded" if result["status"] == "done" else "failed"
+                    h.finished_at = datetime.now()
+                    h.error_message = result.get("message") if result["status"] != "done" else None
+                    db2.commit()
+            finally:
+                db2.close()
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    from app.crud.activity_log import log_activity
+    log_activity(
+        "user", "group_shuttle_start",
+        f"그룹 셔틀 시작: {len(plans)}대 ({', '.join(p['robot_name'] for p in plans)})",
+        source="api_group_shuttle_start",
+    )
+    return {
+        "message": "그룹 셔틀 시작",
+        "count": len(plans),
+        "robots": [{"robot_id": p["robot_id"], "robot_name": p["robot_name"]} for p in plans],
+        "histories": histories,
+    }
+
+
+@router.post("/group-shuttle/stop")
+def api_group_shuttle_stop(data: GroupShuttleStopRequest, db: Session = Depends(get_db)):
+    """그룹 셔틀 정지 — 현재 사이클(W_N 잭다운)까지 마치고 충전소 복귀"""
+    from app.services.jack_service import request_shuttle_stop
+    stopped: list[str] = []
+    for rid in data.robot_ids:
+        robot = db.query(Robot).filter(Robot.id == rid).first()
+        if robot and robot.ip_address:
+            request_shuttle_stop(robot.ip_address)
+            stopped.append(robot.name)
+
+    from app.crud.activity_log import log_activity
+    log_activity(
+        "user", "group_shuttle_stop",
+        f"그룹 셔틀 정지: {', '.join(stopped) if stopped else '없음'}",
+        source="api_group_shuttle_stop",
+    )
+    return {"message": "정지 요청 (현 사이클 후 충전소 복귀)", "robots": stopped}
+
+
+# ══════════════════════════════════════
 # 실행 이력
 # ══════════════════════════════════════
 

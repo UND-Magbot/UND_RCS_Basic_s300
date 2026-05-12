@@ -923,14 +923,17 @@ function drawRobotTargetLines(
   viewScale: number,
 ) {
   const counterScale = 1 / viewScale;
-  let colorIdx = 0;
 
   targets.forEach((target, sn) => {
     const robot = robots.find((r) => r.robotId === sn);
     if (!robot) return;
 
-    const color = TRAJECTORY_COLORS[colorIdx % TRAJECTORY_COLORS.length];
-    colorIdx++;
+    // SN 해시 기반 색 인덱스 — 같은 로봇은 항상 같은 색.
+    // 도착/출발로 targets Map이 갱신돼도 색이 흔들리지 않음.
+    const colorIdx =
+      [...sn].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 0)
+      % TRAJECTORY_COLORS.length;
+    const color = TRAJECTORY_COLORS[colorIdx];
 
     const to = mapToCanvas(target.x, target.y, bounds);
 

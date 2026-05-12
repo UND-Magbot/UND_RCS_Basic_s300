@@ -57,6 +57,108 @@ MOVE_TIMEOUT = 120
 # 실행 중인 작업 추적 (robot_ip → stop flag)
 _stop_flags: dict[str, bool] = {}
 
+# 셔틀 작업 안전정지 플래그 (robot_ip → True): 현재 사이클 끝나면 충전소로 복귀
+_shuttle_stop_flags: dict[str, bool] = {}
+
+# ── W 영역 세마포어 (그룹 셔틀 데드락 차단) ──
+# 한 번에 한 로봇만 W 영역(픽업 정렬/잭킹/복귀 진입)을 점유 가능.
+# 다른 구간(C 이동, C 정렬/잭킹)은 락 없이 자유 진행 → 병렬성 유지.
+_w_zone_lock = _threading.Lock()
+_w_zone_holder: str | None = None             # 현재 점유 중인 로봇 IP
+_w_zone_acquired_at: float = 0.0              # 획득 시각
+_w_zone_progress_at: float = 0.0              # 마지막 진행(heartbeat) 시각
+_w_zone_label: str = ""                       # 현재 단계 라벨 (디버깅용)
+W_ZONE_STUCK_TIMEOUT = 240                    # 진행 정체 시 강제 해제 임계 (초)
+W_ZONE_WAIT_POLL = 1.0                        # 락 대기 폴링 간격 (초)
+
+
+def _w_zone_force_release_if_stuck() -> bool:
+    """락 보유자가 W_ZONE_STUCK_TIMEOUT 동안 progress 갱신 없으면 강제 해제.
+    True 반환 시 강제 해제됨."""
+    global _w_zone_holder, _w_zone_acquired_at, _w_zone_progress_at, _w_zone_label
+    if not _w_zone_holder:
+        return False
+    if time.time() - _w_zone_progress_at < W_ZONE_STUCK_TIMEOUT:
+        return False
+    stuck_ip = _w_zone_holder
+    stuck_label = _w_zone_label
+    held = time.time() - _w_zone_acquired_at
+    logger.warning(
+        f"[w-zone] 스턱 감지 — {stuck_ip} ({stuck_label}) "
+        f"{held:.0f}s 보유, 마지막 진행 {time.time() - _w_zone_progress_at:.0f}s 전 → 강제 해제"
+    )
+    _w_zone_holder = None
+    _w_zone_acquired_at = 0.0
+    _w_zone_progress_at = 0.0
+    _w_zone_label = ""
+    return True
+
+
+def acquire_w_zone(
+    ip: str,
+    label: str = "",
+    on_status: Optional[Callable[[str, str], None]] = None,
+) -> bool:
+    """W 영역 락 획득. 다른 로봇이 점유 중이면 풀릴 때까지 대기.
+    긴급정지(_check_stop)는 응답.
+    """
+    global _w_zone_holder, _w_zone_acquired_at, _w_zone_progress_at, _w_zone_label
+    waited = 0.0
+    notified = False
+    while True:
+        _check_stop(ip)
+        with _w_zone_lock:
+            if _w_zone_holder is None or _w_zone_holder == ip:
+                _w_zone_holder = ip
+                now = time.time()
+                _w_zone_acquired_at = now
+                _w_zone_progress_at = now
+                _w_zone_label = label
+                if waited > 0:
+                    logger.info(f"[w-zone] {ip} 락 획득 ({label}, {waited:.0f}s 대기 후)")
+                else:
+                    logger.info(f"[w-zone] {ip} 락 획득 ({label})")
+                return True
+            # 다른 로봇이 점유 — 스턱 체크 후 양보
+            if _w_zone_force_release_if_stuck():
+                continue  # 강제 해제됐으니 다음 루프에서 즉시 획득 시도
+            current_holder = _w_zone_holder
+            current_label = _w_zone_label
+        if on_status and not notified:
+            on_status("waiting", f"W 영역 점유 대기 중 ({current_holder} {current_label})")
+            notified = True
+        time.sleep(W_ZONE_WAIT_POLL)
+        waited += W_ZONE_WAIT_POLL
+
+
+def progress_w_zone(ip: str):
+    """락 보유자가 단계 진행할 때 호출 — 스턱 타임아웃 리셋"""
+    global _w_zone_progress_at, _w_zone_label
+    if _w_zone_holder == ip:
+        _w_zone_progress_at = time.time()
+
+
+def update_w_zone_label(ip: str, label: str):
+    """디버깅용 단계 라벨 갱신 + progress 갱신"""
+    global _w_zone_label, _w_zone_progress_at
+    if _w_zone_holder == ip:
+        _w_zone_label = label
+        _w_zone_progress_at = time.time()
+
+
+def release_w_zone(ip: str):
+    """W 영역 락 해제 — 자기가 보유한 경우에만"""
+    global _w_zone_holder, _w_zone_acquired_at, _w_zone_progress_at, _w_zone_label
+    with _w_zone_lock:
+        if _w_zone_holder != ip:
+            return
+        held = time.time() - _w_zone_acquired_at
+        logger.info(f"[w-zone] {ip} 락 해제 ({_w_zone_label}, {held:.0f}s 보유)")
+        _w_zone_holder = None
+        _w_zone_acquired_at = 0.0
+        _w_zone_progress_at = 0.0
+        _w_zone_label = ""
+
 # 실행 중인 작업 상태 (robot_ip → job info)
 _job_status: dict[str, dict] = {}
 
@@ -129,6 +231,20 @@ def stop_robot_job(robot_ip: str):
     _job_status.pop(robot_ip, None)
     _next_poi.pop(robot_ip, None)
     logger.info(f"[jack_service] stop flag set for {robot_ip}")
+
+
+def request_shuttle_stop(robot_ip: str):
+    """셔틀 안전정지 요청 — 현재 사이클이 끝난 직후 충전소로 복귀"""
+    _shuttle_stop_flags[robot_ip] = True
+    logger.info(f"[jack_service] shuttle stop requested for {robot_ip}")
+
+
+def is_shuttle_stop_requested(robot_ip: str) -> bool:
+    return bool(_shuttle_stop_flags.get(robot_ip))
+
+
+def clear_shuttle_stop(robot_ip: str):
+    _shuttle_stop_flags.pop(robot_ip, None)
 
 
 def _check_stop(robot_ip: str):
@@ -259,10 +375,104 @@ def cancel_current_move(ip: str) -> dict:
 JACK_WAIT_SEC = 10  # 잭 업/다운 고정 대기 시간(초)
 JACK_IDLE_TIMEOUT = 30  # 잭 다운 후 로봇 idle 대기 최대 시간
 def align_with_retry(ip: str, x: float, y: float, ori: float = 0) -> dict:
-    """align_with_rack 1회 시도"""
+    """align_with_rack 시도 + 일시적 실패 시 1회 재시도.
+
+    재시도 케이스:
+    - 'jack is in up state' / 'lifted' → jack_down 호출 후 JACK_WAIT_SEC 대기 후 재시도
+    - 'rack_detection_error' / 'detection_failed' / 'failed to find rack'
+      → 짧은 대기(LiDAR 노이즈 가능성) 후 재시도. 영구 어긋남이면 결국 실패.
+    """
+    _check_stop(ip)
+    move_id = create_move(ip, "align_with_rack", x, y, ori)
+    result = wait_move(ip, move_id, timeout=120)
+    if result.get("state") == "succeeded":
+        return result
+
+    fail_msg = (result.get("fail_message") or "").lower()
+
+    # case 1: 잭 업 상태에서 align 시도 → jack_down 후 재시도
+    if "jack" in fail_msg and ("up" in fail_msg or "lifted" in fail_msg):
+        logger.warning(f"[{ip}] align 실패 — '{result.get('fail_message')}', jack_down 후 재시도")
+        try:
+            jack_down(ip)
+        except Exception as e:
+            logger.warning(f"[{ip}] 재시도용 jack_down 실패(무시): {e}")
+        _interruptible_sleep(ip, JACK_WAIT_SEC)
+    # case 2: 랙 감지 실패 → 짧은 대기 후 재시도 (LiDAR 노이즈 가능성)
+    elif any(k in fail_msg for k in ("rack_detection", "detection_failed", "find rack", "rack_not_found", "rack not found")):
+        logger.warning(f"[{ip}] align 실패 — '{result.get('fail_message')}', 3초 후 재시도(LiDAR 노이즈 가능성)")
+        _interruptible_sleep(ip, 3)
+    else:
+        # 다른 종류 실패 — 즉시 반환
+        return result
+
     _check_stop(ip)
     move_id = create_move(ip, "align_with_rack", x, y, ori)
     return wait_move(ip, move_id, timeout=120)
+
+
+def unload_point_with_retry(
+    ip: str, x: float, y: float, ori: float = 0,
+    retries: int = 3, wait_between: float = 10.0,
+    move_timeout: int = 240,
+    on_status: Optional[Callable[[str, str], None]] = None,
+    target_label: str = "",
+) -> dict:
+    """to_unload_point 시도. 일시적 장애(점유/장애물/충돌)나 타임아웃 발생 시
+    wait_between초 간격으로 retries회까지 재시도.
+
+    move_timeout은 단일 시도의 wait_move 타임아웃 (3대 동시 운영 시 경로 충돌 회피로
+    인해 도착이 느려질 수 있어 120초 → 240초로 기본값 상향)."""
+    last = None
+    # 일시적 실패로 간주할 키워드 (3대 동시 운영 시 회피 누적/일시 점유)
+    RETRY_KEYWORDS = (
+        "occupied", "blocked", "obstacle", "collision", "stuck",
+        "timed out", "timeout",
+        "unreachable",            # 회피 동작으로 일시적으로 도달 불가
+        "planning",               # planning_failed
+        "no_path", "no path",
+        "in_use", "in use",
+    )
+    for attempt in range(retries):
+        _check_stop(ip)
+        mv = create_move(ip, "to_unload_point", x, y, ori)
+        result = wait_move(ip, mv, timeout=move_timeout)
+        state = result.get("state", "")
+        if state == "succeeded":
+            return result
+        last = result
+        msg = (result.get("fail_message") or "").lower()
+        # 재시도 조건:
+        # - 명시적 키워드 매칭
+        # - state가 timeout
+        # - fail_message가 비어있는 실패 (3대 동시 운영 환경에서 흔히 일시적)
+        retryable = (
+            state == "timeout"
+            or (state != "succeeded" and not msg)
+            or any(k in msg for k in RETRY_KEYWORDS)
+        )
+        if retryable and attempt < retries - 1:
+            if state == "timeout":
+                reason = "타임아웃"
+            elif not msg:
+                reason = f"일시 실패(state={state or 'unknown'})"
+            elif "unreachable" in msg or "planning" in msg or "no_path" in msg or "no path" in msg:
+                reason = "경로 차단(회피 누적)"
+            else:
+                reason = "점유/장애물"
+            logger.warning(
+                f"[{ip}] to_unload_point 일시 실패 ({attempt+1}/{retries}, {reason}): "
+                f"state={state!r} msg={result.get('fail_message')!r} → {wait_between}초 후 재시도"
+            )
+            if on_status:
+                on_status(
+                    "waiting",
+                    f"{target_label or '목적지'} {reason} — {int(wait_between)}초 후 재시도 ({attempt+1}/{retries})",
+                )
+            _interruptible_sleep(ip, wait_between)
+            continue
+        break
+    return last or {"state": "failed", "fail_message": "to_unload_point 실패"}
 
 
 def wait_robot_idle(ip: str, timeout: int = JACK_IDLE_TIMEOUT):
@@ -701,5 +911,294 @@ def run_route_job(
         log_activity("robot", "task_complete", f"작업 완료: {route_names}", source="jack_service")
         return {"status": "done", "message": f"완료: {route_names}"}
 
+    except Exception as e:
+        return _fail(f"오류: {str(e)}")
+
+
+# ── 그룹 셔틀(왕복 반복) 작업 ──
+
+def _list_charging_pois(area_id: int | None = None) -> list[dict]:
+    """area의 충전소 POI 목록 (좌표 포함된 것만)"""
+    from app.database import SessionLocal
+    from app.models.map import MapPOI, RobotMap
+    db = SessionLocal()
+    try:
+        if area_id:
+            active_map = db.query(RobotMap).filter(
+                RobotMap.area_id == area_id, RobotMap.is_active == True
+            ).order_by(RobotMap.id.desc()).first()
+            if not active_map:
+                return []
+            pois = db.query(MapPOI).filter(
+                MapPOI.map_id == active_map.id,
+                MapPOI.poi_type == "charging",
+                MapPOI.is_active == True,
+            ).all()
+        else:
+            pois = db.query(MapPOI).filter(
+                MapPOI.poi_type == "charging",
+                MapPOI.is_active == True,
+            ).all()
+        return [
+            {"name": p.name, "x": p.world_x, "y": p.world_y, "ori": p.angle or 0}
+            for p in pois
+            if p.world_x is not None and p.world_y is not None
+        ]
+    finally:
+        db.close()
+
+
+def _get_charging_poi(area_id: int | None = None) -> dict | None:
+    """area의 첫 충전소 POI (호환성 유지)"""
+    pois = _list_charging_pois(area_id)
+    return pois[0] if pois else None
+
+
+def _get_nearest_charging_poi(area_id: int | None, ref_x: float, ref_y: float) -> dict | None:
+    """ref 좌표에서 가장 가까운 충전소 POI"""
+    pois = _list_charging_pois(area_id)
+    if not pois:
+        return None
+    return min(pois, key=lambda p: (p["x"] - ref_x) ** 2 + (p["y"] - ref_y) ** 2)
+
+
+def _get_robot_position_db(robot_ip: str) -> tuple[float, float] | None:
+    """DB의 RobotStatus에서 로봇 현재 위치 조회 (WebSocket으로 실시간 갱신됨)"""
+    from app.database import SessionLocal
+    from app.models.robot import Robot
+    db = SessionLocal()
+    try:
+        robot = db.query(Robot).filter(Robot.ip_address == robot_ip).first()
+        if not robot or not robot.status:
+            return None
+        st = robot.status
+        if st.position_x is None or st.position_y is None:
+            return None
+        return float(st.position_x), float(st.position_y)
+    finally:
+        db.close()
+
+
+def _dock_to_charger(ip: str, charger: dict, on_status: Optional[Callable[[str, str], None]] = None) -> bool:
+    """충전소 도킹 (standard 접근 → charge 도킹, 5회 재시도)"""
+    def _n(s, m):
+        if on_status:
+            on_status(s, m)
+        logger.info(f"[shuttle-return] {s}: {m}")
+
+    cx, cy, cyaw = charger["x"], charger["y"], charger.get("ori", 0)
+    try:
+        _n("returning", f"충전소({charger['name']})로 이동 중...")
+        std_move = create_move(ip, "standard", cx, cy, cyaw)
+        wait_move(ip, std_move, timeout=120)
+    except Exception as e:
+        logger.warning(f"[shuttle-return] standard 이동 실패: {e}")
+    time.sleep(3)
+
+    for attempt in range(5):
+        try:
+            _n("charging", f"충전소({charger['name']}) 도킹 중... ({attempt+1}/5)")
+            move_id = create_move(ip, "charge", cx, cy, cyaw, charge_retry_count=3)
+            wait_move(ip, move_id, timeout=120)
+            return True
+        except Exception as e:
+            if attempt < 4:
+                logger.warning(f"[shuttle-return] 도킹 재시도 ({attempt+1}/5): {e}")
+                time.sleep(5)
+            else:
+                logger.error(f"[shuttle-return] 도킹 실패: {e}")
+                return False
+    return False
+
+
+def run_shuttle_job(
+    ip: str,
+    pickup: dict,
+    work: dict,
+    wait_sec: int = 0,
+    area_id: int | None = None,
+    charger: Optional[dict] = None,
+    max_cycles: int = 0,
+    on_status: Optional[Callable[[str, str], None]] = None,
+) -> dict:
+    """그룹 셔틀 — pickup(W_N) ↔ work(C_N) 왕복 반복.
+
+    한 사이클: W → align → jack_up → C(to_unload) → jack_down → 대기 →
+              C → align → jack_up → W(to_unload) → jack_down
+
+    max_cycles=0 → 무한 반복 (정지 요청까지)
+    max_cycles>0 → N회 완료 후 자동으로 충전소 복귀
+
+    정지 요청(shuttle_stop)은 사이클 종료 직후에만 체크 → 충전소로 복귀.
+    긴급 정지(stop_robot_job)는 즉시 중단 (기존 동작).
+    """
+    route_names = f"{pickup['name']} ↔ {work['name']}"
+
+    def _notify(status: str, message: str, step: int = 0, total: int = 0):
+        if on_status:
+            on_status(status, message)
+        logger.info(f"[shuttle-job] {status}: {message}")
+        update_job_status(ip,
+            status=status,
+            message=message,
+            route=route_names,
+            current_step=step,
+            total_steps=total,
+            started_at=_job_status.get(ip, {}).get("started_at", time.time()),
+        )
+
+    def _fail(msg: str) -> dict:
+        _notify("error", msg)
+        try: cancel_current_move(ip)
+        except Exception: pass
+        try: jack_down(ip)
+        except Exception: pass
+        try:
+            from app.crud.activity_log import log_activity as _log
+            _log("robot", "task_error", f"셔틀 실패: {msg}", source="jack_service")
+        except Exception:
+            pass
+        clear_job_status(ip)
+        clear_shuttle_stop(ip)
+        release_w_zone(ip)  # 보유 중이면 해제 (다른 로봇이 진행 가능하도록)
+        return {"status": "error", "message": msg}
+
+    # 시작 전 플래그 초기화
+    clear_shuttle_stop(ip)
+    _stop_flags.pop(ip, None)
+    update_job_status(ip, status="started", route=route_names,
+                      current_step=0, total_steps=8,
+                      started_at=time.time(), message="셔틀 작업 시작")
+
+    from app.crud.activity_log import log_activity
+    log_activity("robot", "shuttle_start", f"셔틀 시작: {route_names}", source="jack_service")
+
+    cycle = 0
+    try:
+        while True:
+            # 사이클 시작 직전: 안전정지 요청 체크
+            if is_shuttle_stop_requested(ip):
+                _notify("returning", "정지 요청 — 충전소 복귀 진행")
+                break
+            if max_cycles > 0 and cycle >= max_cycles:
+                _notify("returning", f"최대 {max_cycles}회 완료 — 충전소 복귀 진행")
+                break
+
+            cycle += 1
+            cycle_label = f"#{cycle}" + (f"/{max_cycles}" if max_cycles > 0 else "")
+
+            # === [W 영역 락 획득 — 출발 구간] ===
+            _notify("waiting", f"{cycle_label} W 영역 진입 대기 중...", 1, 8)
+            acquire_w_zone(ip, label=f"{pickup['name']} 출발", on_status=on_status)
+            try:
+                # 1) W_N align
+                _notify("aligning", f"{cycle_label} {pickup['name']} 랙 정렬 중...", 1, 8)
+                progress_w_zone(ip)
+                r = align_with_retry(ip, pickup["x"], pickup["y"], pickup.get("ori", 0))
+                if r["state"] != "succeeded":
+                    return _fail(f"{pickup['name']} 정렬 실패: {r.get('fail_message', r['state'])}")
+
+                # 2) jack_up
+                _notify("jacking_up", f"{cycle_label} {pickup['name']} 잭 올리는 중...", 2, 8)
+                progress_w_zone(ip)
+                jack_up(ip)
+                _interruptible_sleep(ip, JACK_WAIT_SEC)
+
+                # to_unload_point(C) 명령 발사 직전까지만 락 보유 — 출발 명령 직후 해제
+                # (이동 자체는 락 없이 진행해도 다른 로봇과 멀어지므로 안전)
+                progress_w_zone(ip)
+            finally:
+                # W 떠나는 시점에 즉시 해제 → 다음 로봇 진입 가능
+                release_w_zone(ip)
+
+            # 3) C_N 이동 (점유/장애물 재시도) — 락 없이
+            _notify("moving_to_dropoff", f"{cycle_label} {work['name']} 이동 중...", 3, 8)
+            r = unload_point_with_retry(
+                ip, work["x"], work["y"], work.get("ori", 0),
+                retries=3, wait_between=10.0, on_status=on_status,
+                target_label=work["name"],
+            )
+            if r["state"] != "succeeded":
+                return _fail(f"{work['name']} 이동 실패: {r.get('fail_message', '')}")
+
+            # 4) jack_down
+            _notify("jacking_down", f"{cycle_label} {work['name']} 잭 내리는 중...", 4, 8)
+            jack_down(ip)
+            _interruptible_sleep(ip, JACK_WAIT_SEC)
+
+            # 5) 대기시간 (긴급정지에는 응답하지만 안전정지 요청은 사이클 끝까지 무시)
+            if wait_sec > 0:
+                _notify("waiting", f"{cycle_label} {work['name']} 대기 중 ({wait_sec}초)...", 5, 8)
+                _interruptible_sleep(ip, wait_sec)
+
+            # 6) C_N 재정렬
+            _notify("aligning", f"{cycle_label} {work['name']} 랙 재정렬 중...", 6, 8)
+            r = align_with_retry(ip, work["x"], work["y"], work.get("ori", 0))
+            if r["state"] != "succeeded":
+                return _fail(f"{work['name']} 재정렬 실패: {r.get('fail_message', '')}")
+
+            # 7) jack_up
+            _notify("jacking_up", f"{cycle_label} {work['name']} 잭 올리는 중...", 7, 8)
+            jack_up(ip)
+            _interruptible_sleep(ip, JACK_WAIT_SEC)
+
+            # === [W 영역 락 획득 — 복귀 구간] ===
+            _notify("waiting", f"{cycle_label} W 영역 복귀 대기 중...", 8, 8)
+            acquire_w_zone(ip, label=f"{pickup['name']} 복귀", on_status=on_status)
+            try:
+                # 8) W_N 복귀 (점유/장애물 재시도)
+                _notify("moving_to_dropoff", f"{cycle_label} {pickup['name']} 복귀 중...", 8, 8)
+                progress_w_zone(ip)
+                r = unload_point_with_retry(
+                    ip, pickup["x"], pickup["y"], pickup.get("ori", 0),
+                    retries=3, wait_between=10.0, on_status=on_status,
+                    target_label=pickup["name"],
+                )
+                if r["state"] != "succeeded":
+                    return _fail(f"{pickup['name']} 복귀 실패: {r.get('fail_message', '')}")
+
+                # 9) W_N jack_down
+                _notify("jacking_down", f"{cycle_label} {pickup['name']} 잭 내리는 중...", 8, 8)
+                progress_w_zone(ip)
+                jack_down(ip)
+                _interruptible_sleep(ip, JACK_WAIT_SEC)
+                progress_w_zone(ip)
+            finally:
+                # W 잭다운 완료 — 락 해제 (다음 로봇 진입 가능)
+                release_w_zone(ip)
+            log_activity("robot", "shuttle_cycle", f"셔틀 사이클 {cycle} 완료: {route_names}", source="jack_service")
+
+        # === 루프 탈출: 충전소 복귀 ===
+        # 우선순위:
+        #   1) 인자로 받은 charger (UI에서 명시 지정)
+        #   2) 로봇 현재 위치에서 가장 가까운 충전소 (자동 폴백)
+        #   3) area 첫 충전소 (최후 폴백)
+        target_charger = charger
+        fallback_kind = ""
+        if not target_charger:
+            pos = _get_robot_position_db(ip)
+            if pos:
+                target_charger = _get_nearest_charging_poi(area_id, pos[0], pos[1])
+                fallback_kind = " (가까운 충전소 자동 선택)" if target_charger else ""
+        if not target_charger:
+            target_charger = _get_charging_poi(area_id)
+            if target_charger and not fallback_kind:
+                fallback_kind = " (영역 첫 충전소)"
+
+        if target_charger:
+            ok = _dock_to_charger(ip, target_charger, on_status=on_status)
+            msg = f"셔틀 종료 ({cycle}회 완료) — 충전소({target_charger['name']}){fallback_kind} 복귀{' 완료' if ok else ' 실패'}"
+        else:
+            msg = f"셔틀 종료 ({cycle}회 완료) — 충전소 POI 없음, 복귀 생략"
+
+        _notify("done", msg)
+        clear_job_status(ip)
+        clear_shuttle_stop(ip)
+        log_activity("robot", "shuttle_complete", msg, source="jack_service")
+        return {"status": "done", "message": msg}
+
+    except RuntimeError as e:
+        # 긴급정지 (stop_robot_job)
+        return _fail(f"긴급정지: {str(e)}")
     except Exception as e:
         return _fail(f"오류: {str(e)}")
